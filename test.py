@@ -9,7 +9,8 @@ import os
 import sys
 import time
 import uuid
-from typing import Optional
+from typing import AsyncGenerator, Optional
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import numpy as np
 import pymysql
@@ -39,6 +40,19 @@ def load_config():
 APP_CONFIG = load_config()
 MODEL_CONFIG = APP_CONFIG.get("model", {})
 MYSQL_CONFIG = APP_CONFIG.get("mysql", {})
+VLLM_OMNI_CONFIG = APP_CONFIG.get("vllm_omni", {})
+
+
+def as_bool(value, default=False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
 
 HOST = "0.0.0.0"
 PORT = int(MODEL_CONFIG.get("faster_port", MODEL_CONFIG.get("port", 8093)))
@@ -71,6 +85,17 @@ TORCH_NUM_INTEROP_THREADS = int(MODEL_CONFIG.get("torch_num_interop_threads", 1)
 ENABLE_TF32 = bool(MODEL_CONFIG.get("enable_tf32", True))
 PERF_LOG_CHUNKS = bool(MODEL_CONFIG.get("perf_log_chunks", True))
 
+VLLM_OMNI_ENABLED = as_bool(VLLM_OMNI_CONFIG.get("enabled"), False)
+VLLM_OMNI_BASE_URL = VLLM_OMNI_CONFIG.get("base_url", "").rstrip("/")
+VLLM_OMNI_STREAM_WS_URL = VLLM_OMNI_CONFIG.get("streaming_ws_url", "")
+VLLM_OMNI_MODEL = VLLM_OMNI_CONFIG.get("model", MODEL_NAME)
+VLLM_OMNI_TASK_TYPE = VLLM_OMNI_CONFIG.get("task_type", "Base")
+VLLM_OMNI_RESPONSE_FORMAT = VLLM_OMNI_CONFIG.get("response_format", "pcm")
+VLLM_OMNI_STREAM_AUDIO = as_bool(VLLM_OMNI_CONFIG.get("stream_audio"), True)
+VLLM_OMNI_WORD_TIMESTAMPS = as_bool(VLLM_OMNI_CONFIG.get("word_timestamps"), False)
+VLLM_OMNI_TIMEOUT = float(VLLM_OMNI_CONFIG.get("timeout", 120))
+VLLM_OMNI_SPEAKER_MAP = VLLM_OMNI_CONFIG.get("speaker_map", {})
+
 MYSQL_HOST = MYSQL_CONFIG.get("host", "192.168.3.139")
 MYSQL_PORT = int(MYSQL_CONFIG.get("port", 3307))
 MYSQL_DATABASE = MYSQL_CONFIG.get("database", "xiaozhi_esp32_server")
@@ -102,6 +127,106 @@ def get_torch_dtype():
         return torch.float32
     return torch.bfloat16
 
+
+def build_vllm_omni_ws_url() -> str:
+    if VLLM_OMNI_STREAM_WS_URL:
+        return VLLM_OMNI_STREAM_WS_URL
+    if not VLLM_OMNI_BASE_URL:
+        return ""
+
+    parsed = urlparse(VLLM_OMNI_BASE_URL)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    netloc = parsed.netloc or parsed.path
+    base_path = parsed.path if parsed.netloc else ""
+    path = urljoin(base_path.rstrip("/") + "/", "v1/audio/speech/stream")
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def resolve_vllm_voice_name(spk_id) -> str:
+    key = str(spk_id)
+    mapped = VLLM_OMNI_SPEAKER_MAP.get(key)
+    if mapped is not None:
+        return str(mapped)
+    return key
+
+
+def build_vllm_omni_request(text, spk_id, language):
+    payload = {
+        "input": text,
+        "voice": resolve_vllm_voice_name(spk_id),
+        "task_type": VLLM_OMNI_TASK_TYPE,
+        "response_format": VLLM_OMNI_RESPONSE_FORMAT,
+        "stream_audio": VLLM_OMNI_STREAM_AUDIO,
+    }
+    if VLLM_OMNI_MODEL:
+        payload["model"] = VLLM_OMNI_MODEL
+    if language:
+        payload["language"] = language
+    if VLLM_OMNI_WORD_TIMESTAMPS:
+        payload["word_timestamps"] = True
+    return payload
+
+
+def extract_audio_bytes_from_json(payload):
+    for key in ("audio", "audio_b64", "pcm", "data"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            try:
+                return base64.b64decode(value)
+            except Exception:
+                continue
+    return None
+
+
+async def stream_vllm_omni_pcm(text, spk_id, language) -> AsyncGenerator[bytes, None]:
+    ws_url = build_vllm_omni_ws_url()
+    if not ws_url:
+        raise RuntimeError(
+            "vLLM-Omni is enabled but no streaming websocket URL is configured. "
+            "Set vllm_omni.streaming_ws_url or vllm_omni.base_url."
+        )
+
+    try:
+        import websockets
+    except ImportError as exc:
+        raise RuntimeError(
+            "vLLM-Omni streaming requires the 'websockets' package. "
+            "Install uvicorn[standard] or websockets."
+        ) from exc
+
+    request = build_vllm_omni_request(text, spk_id, language)
+    print(
+        f"[vllm-omni] connect={ws_url}, voice={request.get('voice')}, "
+        f"task_type={request.get('task_type')}, response_format={request.get('response_format')}"
+    )
+
+    async with websockets.connect(ws_url, open_timeout=VLLM_OMNI_TIMEOUT) as upstream:
+        await upstream.send(json.dumps(request, ensure_ascii=False))
+
+        while True:
+            try:
+                message = await asyncio.wait_for(upstream.recv(), timeout=VLLM_OMNI_TIMEOUT)
+            except websockets.ConnectionClosedOK:
+                break
+
+            if isinstance(message, bytes):
+                if message:
+                    yield message
+                continue
+
+            try:
+                payload = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+
+            if payload.get("error"):
+                raise RuntimeError(payload.get("error"))
+            if payload.get("type") in {"done", "end", "completed"} or payload.get("done") is True:
+                break
+
+            audio_bytes = extract_audio_bytes_from_json(payload)
+            if audio_bytes:
+                yield audio_bytes
 
 def configure_torch_runtime():
     if TORCH_NUM_THREADS > 0:
@@ -267,6 +392,14 @@ def startup_load_model():
         print("[startup] gpu:", torch.cuda.get_device_name(0))
         print("[startup] torch cuda:", torch.version.cuda)
 
+    if VLLM_OMNI_ENABLED:
+        print("[startup] backend: vllm-omni")
+        print("[startup] vllm_omni_base_url:", VLLM_OMNI_BASE_URL)
+        print("[startup] vllm_omni_stream_ws_url:", build_vllm_omni_ws_url())
+        print("[startup] vllm_omni_model:", VLLM_OMNI_MODEL)
+        print("[startup] local model loading skipped")
+        return
+
     ensure_voice_prompt_columns()
 
     t0 = now()
@@ -286,7 +419,8 @@ def startup_load_model():
 @app.get("/")
 def index():
     return {
-        "service": "faster-qwen3-tts paddlespeech compatible tts",
+        "service": "paddlespeech compatible tts",
+        "backend": "vllm-omni" if VLLM_OMNI_ENABLED else "faster-qwen3-tts",
         "model": MODEL_NAME,
         "prompt_model_id": PROMPT_MODEL_ID,
         "device": DEVICE,
@@ -300,6 +434,8 @@ def index():
         "chunk_size": CHUNK_SIZE,
         "max_new_tokens": MAX_NEW_TOKENS,
         "parity_mode": PARITY_MODE,
+        "vllm_omni_enabled": VLLM_OMNI_ENABLED,
+        "vllm_omni_stream_ws_url": build_vllm_omni_ws_url() if VLLM_OMNI_ENABLED else "",
     }
 
 
@@ -364,24 +500,10 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
 
     async def run_generation(text, spk_id, language, chunk_size, cancel_event):
         try:
-            if torch.cuda.is_available():
+            if torch.cuda.is_available() and not VLLM_OMNI_ENABLED:
                 torch.cuda.reset_peak_memory_stats()
 
             total_t0 = now()
-            selected_voice_prompt = await get_voice_prompt(str(spk_id))
-
-            if cancel_event.is_set():
-                raise asyncio.CancelledError()
-
-            generator = model.generate_voice_clone_streaming(
-                **build_stream_kwargs(
-                    text=text,
-                    language=language,
-                    voice_clone_prompt=selected_voice_prompt,
-                    chunk_size=chunk_size,
-                )
-            )
-
             chunk_count = 0
             total_samples = 0
             total_pcm_bytes = 0
@@ -391,17 +513,9 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
             total_b64_time = 0.0
             total_ws_send_time = 0.0
 
-            while True:
-                if cancel_event.is_set():
-                    raise asyncio.CancelledError()
-
-                next_t0 = now()
-                is_done, item = await asyncio.to_thread(next_generator_item, generator, session_id)
-                next_t1 = now()
-                if is_done:
-                    break
-
-                chunk, sr, timing = item
+            async def send_pcm_chunk(pcm_bytes, sr, timing, next_t0, next_t1):
+                nonlocal chunk_count, total_samples, total_pcm_bytes
+                nonlocal first_chunk_time, prev_chunk_t, total_b64_time, total_ws_send_time
 
                 if first_chunk_time is None:
                     first_chunk_time = next_t1 - total_t0
@@ -409,11 +523,6 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
                         f"[perf] session={session_id} first_chunk={first_chunk_time:.3f}s, "
                         f"sr={sr}, timing={timing}"
                     )
-
-                pcm_t0 = now()
-                pcm_bytes = float_to_pcm16_bytes(chunk)
-                pcm_t1 = now()
-                total_pcm_time += pcm_t1 - pcm_t0
 
                 b64_t0 = now()
                 audio_b64 = base64.b64encode(pcm_bytes).decode("ascii")
@@ -433,7 +542,7 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
                 total_ws_send_time += send_t1 - send_t0
 
                 chunk_count += 1
-                samples = int(len(chunk))
+                samples = int(len(pcm_bytes) // 2)
                 total_samples += samples
                 total_pcm_bytes += len(pcm_bytes)
 
@@ -444,13 +553,64 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
                         f"samples={samples} audio={audio_sec:.3f}s "
                         f"interval={next_t1 - prev_chunk_t:.3f}s "
                         f"next={next_t1 - next_t0:.3f}s "
-                        f"pcm={pcm_t1 - pcm_t0:.4f}s "
                         f"b64={b64_t1 - b64_t0:.4f}s "
                         f"ws_send={send_t1 - send_t0:.4f}s "
                         f"timing={timing}"
                     )
 
                 prev_chunk_t = send_t1
+
+            if VLLM_OMNI_ENABLED:
+                async for pcm_bytes in stream_vllm_omni_pcm(text, spk_id, language):
+                    if cancel_event.is_set():
+                        raise asyncio.CancelledError()
+                    t = now()
+                    await send_pcm_chunk(
+                        pcm_bytes=pcm_bytes,
+                        sr=SAMPLE_RATE,
+                        timing={"backend": "vllm-omni"},
+                        next_t0=t,
+                        next_t1=t,
+                    )
+            else:
+                selected_voice_prompt = await get_voice_prompt(str(spk_id))
+
+                if cancel_event.is_set():
+                    raise asyncio.CancelledError()
+
+                generator = model.generate_voice_clone_streaming(
+                    **build_stream_kwargs(
+                        text=text,
+                        language=language,
+                        voice_clone_prompt=selected_voice_prompt,
+                        chunk_size=chunk_size,
+                    )
+                )
+
+                while True:
+                    if cancel_event.is_set():
+                        raise asyncio.CancelledError()
+
+                    next_t0 = now()
+                    is_done, item = await asyncio.to_thread(next_generator_item, generator, session_id)
+                    next_t1 = now()
+                    if is_done:
+                        break
+
+                    chunk, sr, timing = item
+
+                    pcm_t0 = now()
+                    pcm_bytes = float_to_pcm16_bytes(chunk)
+                    pcm_t1 = now()
+                    total_pcm_time += pcm_t1 - pcm_t0
+
+                    await send_pcm_chunk(
+                        pcm_bytes=pcm_bytes,
+                        sr=sr,
+                        timing=timing,
+                        next_t0=next_t0,
+                        next_t1=next_t1,
+                    )
 
             await send_json({"status": 2, "session": session_id})
             total_t1 = now()
@@ -464,7 +624,8 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
                 f"pcm_total={total_pcm_time:.4f}s b64_total={total_b64_time:.4f}s "
                 f"ws_send_total={total_ws_send_time:.4f}s pcm_bytes={total_pcm_bytes}"
             )
-            print("[summary]", gpu_mem(prefix=f"session={session_id} "))
+            if not VLLM_OMNI_ENABLED:
+                print("[summary]", gpu_mem(prefix=f"session={session_id} "))
 
         except asyncio.CancelledError:
             print(f"[ws] generation cancelled: session={session_id}")
@@ -577,7 +738,10 @@ async def paddlespeech_compatible_ws(websocket: WebSocket):
             current_cancel_event = asyncio.Event()
 
             async def generation_runner():
-                if ENABLE_GENERATION_LOCK:
+                if VLLM_OMNI_ENABLED:
+                    print(f"[perf] session={session_id} queue_wait=0.0000s backend=vllm-omni")
+                    await run_generation(text, spk_id, language, chunk_size, current_cancel_event)
+                elif ENABLE_GENERATION_LOCK:
                     async with generation_lock:
                         print(f"[perf] session={session_id} queue_wait={now() - queue_t0:.4f}s")
                         await run_generation(text, spk_id, language, chunk_size, current_cancel_event)
