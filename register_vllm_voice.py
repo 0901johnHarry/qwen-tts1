@@ -14,7 +14,8 @@ import requests
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from pydantic import BaseModel
 
-CONFIG_FILE = os.getenv("TTS_CONFIG_FILE", "tts_config.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.getenv("TTS_CONFIG_FILE", os.path.join(BASE_DIR, "tts_config.json"))
 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 MODEL_CONFIG = CONFIG.get("model", {})
@@ -111,18 +112,25 @@ async def create_tts_wav(request: TTSWavRequest):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--spk-id", required=True)
-    parser.add_argument("--voice-name", required=True)
+    parser.add_argument("--cli", action="store_true", help="use command-line registration instead of starting the API")
+    parser.add_argument("--spk-id", required=False)
+    parser.add_argument("--voice-name", required=False)
     parser.add_argument("--name", default="")
-    parser.add_argument("--ref-audio", required=True)
-    parser.add_argument("--ref-text", required=True)
+    parser.add_argument("--ref-audio")
+    parser.add_argument("--ref-text")
     parser.add_argument("--mode", default="icl", choices=["icl", "xvec"])
     args = parser.parse_args()
+
+    if not args.cli:
+        import uvicorn
+        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("TTS_REGISTER_PORT", "8095")))
+        return
+
+    required = {"--spk-id": args.spk_id, "--voice-name": args.voice_name, "--ref-audio": args.ref_audio, "--ref-text": args.ref_text}
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        parser.error("--cli requires: " + ", ".join(missing))
     register_voice(args.spk_id, args.voice_name, args.name, args.ref_audio, args.ref_text, args.ref_audio, args.mode)
 
 if __name__ == "__main__":
-    if os.getenv("TTS_REGISTER_API", "0") == "1":
-        import uvicorn
-        uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("TTS_REGISTER_PORT", "8095")))
-    else:
-        main()
+    main()
