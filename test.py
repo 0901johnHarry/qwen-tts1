@@ -11,6 +11,7 @@ from typing import AsyncGenerator
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import pymysql
 
 
 CONFIG_FILE = os.getenv("TTS_CONFIG_FILE", "tts_config.json")
@@ -58,6 +59,8 @@ VLLM_OMNI_MAX_NEW_TOKENS = int(VLLM_OMNI_CONFIG.get("max_new_tokens", VLLM_OMNI_
 VLLM_OMNI_WORD_TIMESTAMPS = as_bool(VLLM_OMNI_CONFIG.get("word_timestamps"), False)
 VLLM_OMNI_TIMEOUT = float(VLLM_OMNI_CONFIG.get("timeout", 120))
 VLLM_OMNI_SPEAKER_MAP = VLLM_OMNI_CONFIG.get("speaker_map", {})
+MYSQL_CONFIG = APP_CONFIG.get("mysql", {})
+VOICE_TABLE = MYSQL_CONFIG.get("table", "tts_voice_prompt")
 
 app = FastAPI()
 
@@ -87,11 +90,18 @@ def build_vllm_omni_ws_url() -> str:
 
 def resolve_vllm_voice_name(spk_id) -> str:
     key = str(spk_id)
+    try:
+        conn = pymysql.connect(host=MYSQL_CONFIG.get("host", "localhost"), port=int(MYSQL_CONFIG.get("port", 3306)), database=MYSQL_CONFIG.get("database", "xiaozhi"), user=MYSQL_CONFIG.get("user", "root"), password=MYSQL_CONFIG.get("password", "123456"), charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor, connect_timeout=2)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT voice_name FROM `{VOICE_TABLE}` WHERE spk_id=%s AND enabled=1 LIMIT 1", (key,))
+                row = cur.fetchone()
+                if row and row.get("voice_name"):
+                    return str(row["voice_name"])
+    except Exception as exc:
+        print(f"[voice] mysql lookup failed spk_id={key}: {exc!r}")
     mapped = VLLM_OMNI_SPEAKER_MAP.get(key)
-    if mapped is not None:
-        return str(mapped)
-    return key
-
+    return str(mapped) if mapped is not None else key
 
 def build_vllm_omni_session_config(spk_id, language):
     payload = {
