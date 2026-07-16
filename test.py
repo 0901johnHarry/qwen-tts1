@@ -54,6 +54,7 @@ VLLM_OMNI_MODEL = VLLM_OMNI_CONFIG.get("model", "")
 VLLM_OMNI_TASK_TYPE = VLLM_OMNI_CONFIG.get("task_type", "Base")
 VLLM_OMNI_RESPONSE_FORMAT = VLLM_OMNI_CONFIG.get("response_format", "pcm")
 VLLM_OMNI_STREAM_AUDIO = as_bool(VLLM_OMNI_CONFIG.get("stream_audio"), True)
+VLLM_OMNI_MAX_TOKENS = int(VLLM_OMNI_CONFIG.get("max_tokens", 2048))
 VLLM_OMNI_WORD_TIMESTAMPS = as_bool(VLLM_OMNI_CONFIG.get("word_timestamps"), False)
 VLLM_OMNI_TIMEOUT = float(VLLM_OMNI_CONFIG.get("timeout", 120))
 VLLM_OMNI_SPEAKER_MAP = VLLM_OMNI_CONFIG.get("speaker_map", {})
@@ -98,6 +99,7 @@ def build_vllm_omni_session_config(spk_id, language):
         "task_type": VLLM_OMNI_TASK_TYPE,
         "response_format": VLLM_OMNI_RESPONSE_FORMAT,
         "stream_audio": VLLM_OMNI_STREAM_AUDIO,
+        "max_tokens": VLLM_OMNI_MAX_TOKENS,
     }
     if VLLM_OMNI_MODEL:
         payload["model"] = VLLM_OMNI_MODEL
