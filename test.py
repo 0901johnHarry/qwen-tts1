@@ -92,9 +92,8 @@ def resolve_vllm_voice_name(spk_id) -> str:
     return key
 
 
-def build_vllm_omni_request(text, spk_id, language):
+def build_vllm_omni_session_config(spk_id, language):
     payload = {
-        "input": text,
         "voice": resolve_vllm_voice_name(spk_id),
         "task_type": VLLM_OMNI_TASK_TYPE,
         "response_format": VLLM_OMNI_RESPONSE_FORMAT,
@@ -136,14 +135,16 @@ async def stream_vllm_omni_pcm(text, spk_id, language) -> AsyncGenerator[bytes, 
             "Install uvicorn[standard] or websockets."
         ) from exc
 
-    request = build_vllm_omni_request(text, spk_id, language)
+    config = build_vllm_omni_session_config(spk_id, language)
     print(
-        f"[vllm-omni] connect={ws_url}, voice={request.get('voice')}, "
-        f"task_type={request.get('task_type')}, response_format={request.get('response_format')}"
+        f"[vllm-omni] connect={ws_url}, voice={config.get('voice')}, "
+        f"task_type={config.get('task_type')}, response_format={config.get('response_format')}"
     )
 
     async with websockets.connect(ws_url, open_timeout=VLLM_OMNI_TIMEOUT) as upstream:
-        await upstream.send(json.dumps(request, ensure_ascii=False))
+        await upstream.send(json.dumps({"type": "session.config", **config}, ensure_ascii=False))
+        await upstream.send(json.dumps({"type": "input.text", "text": text}, ensure_ascii=False))
+        await upstream.send(json.dumps({"type": "input.done"}, ensure_ascii=False))
 
         while True:
             try:
@@ -161,9 +162,12 @@ async def stream_vllm_omni_pcm(text, spk_id, language) -> AsyncGenerator[bytes, 
             except json.JSONDecodeError:
                 continue
 
-            if payload.get("error"):
-                raise RuntimeError(payload.get("error"))
-            if payload.get("type") in {"done", "end", "completed"} or payload.get("done") is True:
+            msg_type = payload.get("type")
+            if msg_type == "error" or payload.get("error") is True:
+                raise RuntimeError(payload.get("message") or payload.get("error") or payload)
+            if msg_type == "audio.done":
+                continue
+            if msg_type in {"session.done", "done", "end", "completed"} or payload.get("done") is True:
                 break
 
             audio_bytes = extract_audio_bytes_from_json(payload)
