@@ -100,6 +100,7 @@ class TTSRequest(BaseModel):
     spk_id: str
     text: str
     language: str = "Chinese"
+    max_new_tokens: int = 2048
 
 
 @app.get("/")
@@ -127,12 +128,15 @@ async def create_voice_prompt(spk_id: str = Form(...), name: str = Form(""), voi
 async def create_tts_wav(request: TTSRequest):
     try:
         voice = await asyncio.to_thread(ensure_registered, request.spk_id)
-        response = await asyncio.to_thread(requests.post, f"{VLLM_BASE}/v1/audio/speech", json={"input": request.text, "voice": voice, "task_type": TASK_TYPE, "response_format": "wav", "language": request.language}, timeout=TIMEOUT)
+        response = await asyncio.to_thread(requests.post, f"{VLLM_BASE}/v1/audio/speech", json={"input": request.text, "voice": voice, "task_type": TASK_TYPE, "response_format": "wav", "language": request.language, "max_new_tokens": request.max_new_tokens}, timeout=TIMEOUT)
         if not response.ok: raise RuntimeError(f"vLLM-Omni error {response.status_code}: {response.text[:500]}")
-        return Response(content=response.content, media_type="audio/wav")
+        return Response(content=response.content, media_type="audio/wav", headers={"Content-Disposition": f'attachment; filename="tts_{request.spk_id}.wav"'})
     except Exception as exc: raise HTTPException(400, repr(exc)) from exc
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("TTS_REGISTER_PORT", "8095")))
+
+
+
